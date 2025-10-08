@@ -1,0 +1,162 @@
+import cv2
+import mediapipe as mp
+import pyautogui
+import numpy as np
+import time
+from pynput.keyboard import Key, Controller
+from collections import deque
+
+# ------------------- Setup -------------------
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+mpFaceMesh = mp.solutions.face_mesh
+faceMesh = mpFaceMesh.FaceMesh(max_num_faces=1, min_detection_confidence=0.6)
+mpDraw = mp.solutions.drawing_utils
+
+keyboard = Controller()
+screen_width, screen_height = pyautogui.size()
+
+pTime = 0
+prev_nx = prev_ny = None
+smoothing = 0.3
+
+mode = "keyboard"  # can be "keyboard" or "mouse"
+calib_offset_x = 0
+calib_offset_y = 0
+
+# Swipe detection
+x_history = deque(maxlen=5)
+y_history = deque(maxlen=5)
+
+# ------------------- Helper Functions -------------------
+
+def detect_actions(nose_x, nose_y, mouth_open, x_hist, y_hist):
+    action = None
+    # Head left/right (x axis)
+    if len(x_hist) == x_hist.maxlen:
+        dx = x_hist[-1] - x_hist[0]
+        if dx > 25:
+            action = "right"
+            x_hist.clear()
+        elif dx < -25:
+            action = "left"
+            x_hist.clear()
+
+    # Head up/down (y axis)
+    if len(y_hist) == y_hist.maxlen:
+        dy = y_hist[-1] - y_hist[0]
+        if dy < -15:  # head up
+            action = "jump"
+            y_hist.clear()
+        elif dy > 15:  # head down
+            action = "crouch"
+            y_hist.clear()
+
+    # Mouth open triggers special action
+    if mouth_open:
+        action = "mouth"
+
+    return action
+
+# ------------------- Main Loop -------------------
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    h, w, _ = frame.shape
+    imgRGB = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = faceMesh.process(imgRGB)
+
+    action = None
+    mouth_open = False
+
+    if results.multi_face_landmarks:
+        faceLms = results.multi_face_landmarks[0]
+
+        # Nose tip landmark = 1
+        nose = faceLms.landmark[1]
+        nx = int(nose.x * w) - calib_offset_x
+        ny = int(nose.y * h) - calib_offset_y
+
+        # Mirror horizontally
+        nx = w - nx
+
+        # Smoothing
+        if prev_nx is not None and prev_ny is not None:
+            nx = int(prev_nx * (1 - smoothing) + nx * smoothing)
+            ny = int(prev_ny * (1 - smoothing) + ny * smoothing)
+        prev_nx, prev_ny = nx, ny
+
+        x_history.append(nx)
+        y_history.append(ny)
+
+        # Mouth detection
+        top_lip = faceLms.landmark[13].y
+        bottom_lip = faceLms.landmark[14].y
+        if (bottom_lip - top_lip) * h > 20:
+            mouth_open = True
+
+        # Detect actions
+        action = detect_actions(nx, ny, mouth_open, x_history, y_history)
+
+        # Draw landmarks
+        mpDraw.draw_landmarks(frame, faceLms, mpFaceMesh.FACEMESH_TESSELATION)
+        cv2.circle(frame, (nx, ny), 5, (0, 0, 255), cv2.FILLED)
+
+        # Perform actions
+        if mode == "keyboard" and action:
+            if action == "jump":
+                keyboard.press(Key.up)
+                keyboard.release(Key.up)
+            elif action == "crouch":
+                keyboard.press(Key.down)
+                keyboard.release(Key.down)
+            elif action == "left":
+                keyboard.press(Key.left)
+                keyboard.release(Key.left)
+            elif action == "right":
+                keyboard.press(Key.right)
+                keyboard.release(Key.right)
+            elif action == "mouth":
+                keyboard.press(Key.space)
+                keyboard.release(Key.space)
+
+        elif mode == "mouse":
+            # Map nose to screen
+            screen_x = np.interp(nx, [0, w], [0, screen_width])
+            screen_y = np.interp(ny, [0, h], [0, screen_height])
+            pyautogui.moveTo(screen_x, screen_y)
+
+    # ------------------- FPS & UI -------------------
+    cTime = time.time()
+    fps = 1 / (cTime - pTime) if pTime != 0 else 0
+    pTime = cTime
+
+    cv2.putText(frame, f"FPS: {int(fps)}", (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    cv2.putText(frame, f"Mode: {mode}", (10, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+    if action:
+        cv2.putText(frame, f"Action: {action}", (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+    img_mirrored = cv2.flip(frame, 1)
+    cv2.imshow("Face Game Controller", img_mirrored)
+    cv2.setWindowProperty("Face Game Controller", cv2.WND_PROP_TOPMOST, 1)
+
+    key = cv2.waitKey(1)
+    if key == ord('q'):
+        break
+    elif key == ord('c'):
+        if prev_nx and prev_ny:
+            calib_offset_x, calib_offset_y = prev_nx - (w // 2), prev_ny - (h // 2)
+            print("Calibrated offsets:", calib_offset_x, calib_offset_y)
+    elif key == ord('m'):
+        mode = "mouse" if mode == "keyboard" else "keyboard"
+        print("Mode switched to:", mode)
+
+cap.release()
+cv2.destroyAllWindows()
